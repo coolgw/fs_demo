@@ -80,3 +80,9 @@ if [ ! -s "$MOUNT_DIR/diskfile.txt" ] || [ "$(cat "$MOUNT_DIR/diskfile.txt")" !=
 else
     echo "FAILURE: Written data is still present. Check if VM kernel behaves differently."
 fi
+
+echo "=== Step 10: Running Visual Disk Analyzer ==="
+echo "Unmounting $MOUNT_DIR to safely analyze the raw disk image..."
+sudo umount "$MOUNT_DIR" || true
+"$SRC_DIR/../analyze_disk.py" "$DISK_IMG"
+

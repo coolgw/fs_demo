@@ -77,3 +77,9 @@ if [ ! -s "$MOUNT_DIR/diskfile.txt" ]; then
 else
     echo "FAILURE: File is not 0 bytes. Check if VM kernel behaves differently."
 fi
+
+echo "=== Step 10: Running Visual Disk Analyzer ==="
+echo "Unmounting $MOUNT_DIR to safely analyze the raw disk image..."
+sudo umount "$MOUNT_DIR" || true
+"$SRC_DIR/../analyze_disk.py" "$DISK_IMG"
+
