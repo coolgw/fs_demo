@@ -616,6 +616,11 @@ During the development of `demofs`, several bugs were introduced and fixed. Thes
 - **Consequence**: When writing data, the changes were stored in memory (Page Cache). However, during unmount or when `sync` was run, the kernel was unable to write the dirty pages to disk because there was no `.writepages` callback. The dirty pages were discarded, resulting in silent data loss.
 - **Fix**: Register `.writepages` to point to a block-mapping writeback function like `mpage_writepages`.
 
+### Case 4: On-Disk Metadata Leak (The Missing Superblock Write-back Bug)
+- **Bug**: In version 4, while the driver resolved earlier unmount and page-cache caching bugs, it neglected to update and write back Block 0 (the on-disk Superblock structure) when a physical block or inode was allocated inside `demofs_allocate_block` and `demofs_allocate_inode`.
+- **Consequence**: The raw bitmaps on disk recorded the allocations correctly (showing Block 5 and Inode 2 allocated). However, the on-disk superblock counters (`free_blocks` and `free_inodes`) remained frozen at their formatting values (`251` free blocks instead of the correct `250`). This resulted in a metadata desynchronization on disk, visible via hex analyses or diagnostics.
+- **Fix (Implemented in Version 5)**: Introduce an on-disk metadata write-back helper function `demofs_adjust_free_resources` that reads the superblock block using `sb_bread`, decrements the free counts dynamically, marks the buffer dirty, and flushes it back to Block 0 upon allocations.
+
 ---
 
 ## 10. Step-by-Step Guide to Writing Your First Filesystem
@@ -730,17 +735,69 @@ Directories are formatted as files whose blocks contain array elements of `struc
 - **Entry 1 (`..`)**: Offset `0x4040` to `0x407F`:
   - `inode`: `1` (`01 00 00 00`)
   - `name`: `..` (`2e 2e 00 ...` zero-filled)
-- **Entries 2–63**: Completely zero-filled.
+- Entries 2–63**: Completely zero-filled.
 
 ---
 
-### B. Walkthrough: Locating `/diskfile.txt` Manually on Disk
+### B. Under the Hood: Lifecycle of a Write Command
 
-Suppose the driver has been loaded and mounted, and a user runs:
+To understand how our disk volume gets populated, we must trace what occurs inside the Linux kernel and our `demofs_v5` driver when a user runs the following command:
+
 ```bash
-echo "Transient Inode Bug!" > /mnt/test/diskfile.txt
+echo -n "Demofs Version 5 is Perfectly Synchronized!" > /tmp/test_mount_v5/diskfile.txt
 ```
-This write-back allocation creates a regular file. Now we want to inspect the binary `disk.img` to find this file's raw contents without mounting it.
+
+This simple userspace command triggers a series of low-level VFS and page-cache interactions:
+
+#### Step 1: Inode and Path Creation (The `open` call with `O_CREAT`)
+When the shell attempts to create `/tmp/test_mount_v5/diskfile.txt`:
+1. The VFS enters path resolution and calls **`demofs_lookup`** on the root directory (`Inode 1`) for `"diskfile.txt"`. Since the file does not exist yet, the lookup returns `NULL`.
+2. Because of the `O_CREAT` flag, the VFS invokes the root directory's **`.create`** callback, mapped to **`demofs_create`** in our driver:
+   - **Inode Allocation**: `demofs_create` calls **`demofs_allocate_inode()`**, which reads Inode Bitmap (Block 2), allocates **Inode 2** (bit 2 is flipped from `0` to `1` changing the first bitmap byte from `0x03` to `0x07`), and writes the updated bitmap back.
+   - **Superblock Update**: It calls **`demofs_adjust_free_resources(sb, 0, -1)`** to decrement the on-disk `free_inodes` count from `30` to `29`.
+   - **Inode Instantiation**: It calls the kernel's `new_inode(sb)` helper to allocate a memory `struct inode` in RAM and hardcodes `inode->i_ino = 2`.
+   - **On-Disk Metadata**: It writes the raw 64-byte `struct demofs_inode` structure for Inode 2 into the Inode Table block (Block 3) at offset `0x3080` (setting `mode` to `-rw-r--r--`, `size` to `0`, and block list `block[0..11]` to `0`).
+   - **Directory Indexing**: It calls **`demofs_add_dir_entry`**, which reads Block 4 (Root directory block), locates Slot 2 (at offset `0x4080`), and records a new 64-byte `struct demofs_dir_entry` mapping `"diskfile.txt"` to Inode 2.
+   - **Memory Registration**: It links the in-memory inode with the dentry cache via `d_instantiate` and returns the file descriptor back to userspace.
+
+#### Step 2: Reserving Memory & Allocating Disk Space (The `write_begin` callback)
+When the shell starts writing the 43 ASCII bytes of `"Demofs Version 5 is Perfectly Synchronized!"` into the file descriptor:
+1. The VFS enters the standard page-cached writer pipeline (`generic_perform_write()`).
+2. It calls **`demofs_aops.write_begin()`** for Logical Block offset `0` (`iblock = 0`).
+3. `write_begin` calls the kernel standard buffer manager to allocate a fresh **Folio** in the Page Cache (RAM) and lock it.
+4. It calls our **`demofs_get_block`** with `create = 1` (allocation-intent write):
+   - `demofs_get_block` reads the Inode Table block (Block 3), extracts Inode 2's structure, and discovers `di->block[0]` is `0` (unallocated).
+   - **Block Allocation**: It calls **`demofs_allocate_block`**, which reads the Block Bitmap (Block 1), allocates **Block 5** (bit 5 is flipped from `0` to `1` changing the bitmap byte from `0x1f` to `0x3f`), and flushes the bitmap back to disk.
+   - **Superblock Update**: It calls **`demofs_adjust_free_resources(sb, -1, 0)`** to decrement the on-disk `free_blocks` count from `251` to `250`.
+   - **Metadata Update**: It records `di->block[0] = 5` and increments `di->blocks = 1` inside Inode 2's structure, marking the Inode Table block as dirty.
+   - **Buffer head mapping**: It calls `map_bh` to bind Physical Block 5 to the folio's buffer head.
+
+#### Step 3: Copying Userspace Data to RAM
+1. The kernel copies the 43 ASCII bytes `"Demofs Version 5 is Perfectly Synchronized!"` from user space directly into the locked Page Cache folio inside RAM.
+
+#### Step 4: Finalizing In-Memory State (The `write_end` callback)
+1. Once the memory copy is finished, the VFS invokes **`demofs_aops.write_end()`** (linked to standard `generic_write_end`):
+   - It updates our in-memory inode size `inode->i_size` to `43` bytes and marks the in-memory inode structure as dirty in RAM.
+   - It invokes **`block_dirty_folio()`** (the `.dirty_folio` callback), which marks the Page Cache folio as **dirty** (`PG_dirty = 1`), registering it to the address space's dirty list.
+   - It unlocks the folio. At this point, the userspace `write()` syscall returns success. **The written data is currently 100% in RAM.**
+
+#### Step 5: Committing the Page Cache to disk (The unmount / flush callback)
+When our verification script calls `sudo umount /tmp/test_mount_v5` to safely unmount the directory:
+1. The unmount system call initiates flushing of all active, dirty Page Cache folios belonging to our mount point.
+2. It invokes our driver's writeback callback **`demofs_aops.writepages`**:
+   - `demofs_writepages` delegates to `mpage_writepages(mapping, wbc, demofs_get_block)`.
+   - The writepages engine locks our dirty folio, clears its `PG_dirty` flag, queries `demofs_get_block` (which immediately resolves Logical Block 0 $\rightarrow$ Physical Block 5), and submits an asynchronous Block I/O request (BIO) to copy the 43 bytes from RAM straight into **Block 5** of the physical loopback file.
+3. Once the hardware write completions return, the loop mount is safely detached, leaving our `disk_v5.img` in a perfectly updated, persistent, and synchronized state!
+
+---
+
+### C. Walkthrough: Locating `/diskfile.txt` Manually on Disk
+
+Suppose the `demofs_v5` driver has been loaded and mounted, and a user runs our synchronized test script:
+```bash
+echo -n "Demofs Version 5 is Perfectly Synchronized!" > /tmp/test_mount_v5/diskfile.txt
+```
+This write-back allocation creates a regular file. Now we want to inspect the binary `disk.img` using our visual analyzer `./analyze_disk.py` to trace this file's raw contents and locate its inode metadata.
 
 ```text
                                Manual Path Resolution Flow
@@ -770,50 +827,56 @@ This write-back allocation creates a regular file. Now we want to inspect the bi
                                             ▼ Read File Data Block 5 (Offset 0x5000)
                               ┌──────────────────────────┐
                               │  Extract raw ASCII bytes │
-                              │  "Transient Inode Bug!"  │
+                              │"Demofs Version 5 is Per-"│
                               └──────────────────────────┘
 ```
 
-Here is the exact step-by-step translation process:
+Here is the exact step-by-step translation process, completely mapped to our analyzer's output:
 
 #### Step 1: Read Root Inode to Locate Root Directory Data
 1. All directory traversals begin at the root directory, which is hard-coded as **Inode 1**.
 2. Calculate the byte offset of Inode 1 in the Inode Table:
    $$\text{Offset} = \text{Block 3 Offset} + (\text{Inode Number} \times 64 \text{ bytes}) = 12288 + (1 \times 64) = 12352 \text{ bytes} = \text{0x3040}$$
-3. Read 64 bytes at `0x3040`. In the block pointers table (`block[0..11]`), we extract `block[0]`, which holds the value **`4`**. This indicates the root directory contents are stored in physical **Block 4**.
+3. Look at the Block 3 hex dump at `0x3040`:
+   `0x3040:  ed 41 00 00 00 00 02 00  00 10 00 00 01 00 00 00`
+   `0x3050:  04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00`
+   - In the block pointers table (bytes `0x3050`-`0x3053`), we extract `block[0]` which reads **`04 00 00 00`** (little-endian for **`4`**). This tells us that the root directory entries are stored in physical **Block 4**.
 
-#### Step 2: Read Root Directory Entries to Find "diskfile.txt"
+#### Step 2: Read Root Directory Data (Block 4) to Find "diskfile.txt"
 1. Calculate the byte offset of Block 4:
    $$\text{Offset} = 4 \times 4096 = 16384 \text{ bytes} = \text{0x4000}$$
-2. Scan the 64-byte directory entry slots inside Block 4:
+2. Scan the 64-byte directory entry slots inside Block 4 at `0x4000`:
    - **Slot 0 (`0x4000` - `0x403F`)**: Inode `1`, Name `.`
    - **Slot 1 (`0x4040` - `0x407F`)**: Inode `1`, Name `..`
-   - **Slot 2 (`0x4080` - `0x40BF`)**: You find a new entry containing:
-     - `inode`: `0x00000002` (Stored as `02 00 00 00` at bytes `0x4080`-`0x4083`)
-     - `name`: `diskfile.txt` (ASCII string starting at `0x4084`)
-3. This match confirms that `/diskfile.txt` is bound to **Inode 2**.
+   - **Slot 2 (`0x4080` - `0x40BF`)**:
+     `0x4080:  02 00 00 00 64 69 73 6b  66 69 6c 65 2e 74 78 74   |....diskfile.txt|`
+     - `inode`: **`02 00 00 00`** $\rightarrow$ **Inode 2** (decimal).
+     - `name`: `64 69 73 6b 66 69 6c 65 2e 74 78 74` $\rightarrow$ **`"diskfile.txt"`** in ASCII.
+3. This match confirms that `/diskfile.txt` is dynamically bound to **Inode 2**.
 
-#### Step 3: Read File Inode to Locate Raw Data Blocks
+#### Step 3: Read File Inode 2 to Locate Physical Data Blocks
 1. Calculate the byte offset of Inode 2 in the Inode Table:
    $$\text{Offset} = 12288 + (2 \times 64) = 12416 \text{ bytes} = \text{0x3080}$$
-2. Read 64 bytes at `0x3080`.
-3. Read fields to analyze file parameters:
-   - **`mode`**: `0x81A4` (octal `100644` - regular file)
-   - **`size`**: `0x15` (stored as `15 00 00 00` representing decimal 21 bytes)
-   - **`blocks`**: `1`
-   - **`block[0]`**: **`5`** (Stored as `05 00 00 00` representing physical Block 5)
-   - **`block[1..11]`**: All zeros (no other blocks allocated)
+2. Look at the Block 3 hex dump at Inode 2 (`0x3080` to `0x30BF`):
+   `0x3080:  a4 81 00 00 00 00 01 00  2c 00 00 00 01 00 00 00`
+   `0x3090:  05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00`
+3. Extract Inode 2's dynamic parameters:
+   - **`mode`** (`0x3080`-`0x3081`): `a4 81` $\rightarrow$ `0x81a4` (Regular regular file `-rw-r--r--`).
+   - **`size`** (`0x3088`-`0x308B`): `2c 00 00 00` $\rightarrow$ **`44` bytes** in decimal ($2\text{C} \text{ hex} = 44$).
+   - **`blocks`** (`0x308C`-`0x308F`): `01 00 00 00` $\rightarrow$ `1` block allocated.
+   - **`block[0]`** (`0x3090`-`0x3093`): **`05 00 00 00`** $\rightarrow$ **Physical Block `5`**.
 
 #### Step 4: Extract File Contents from Block 5
 1. Calculate the byte offset of physical Block 5:
    $$\text{Offset} = 5 \times 4096 = 20480 \text{ bytes} = \text{0x5000}$$
-2. Read from `0x5000` onwards for the file's size (21 bytes).
-3. The raw hex reads:
-   `54 72 61 6e 73 69 65 6e 74 20 49 6e 6f 64 65 20 42 75 67 21 0a`
-   Which translates directly to standard ASCII:
-   `Transient Inode Bug!\n`
+2. Read 44 bytes from `0x5000`. The raw hex is:
+   `5000:  44 65 6d 6f 66 73 20 56  65 72 73 69 6f 6e 20 35   |Demofs Version 5|`
+   `5010:  20 69 73 20 50 65 72 66  65 63 74 6c 79 20 53 79   | is Perfectly Sy|`
+   `5020:  6e 63 68 72 6f 6e 69 7a  65 64 21                  |nchronized!|`
+3. This translates directly to our written dynamic content:
+   `Demofs Version 5 is Perfectly Synchronized!`
 
-Using this systematic mathematical approach, you can physically resolve and debug any path, directory, or file allocation directly from a raw binary disk image. This capability is incredibly useful when troubleshooting low-level corruptions or verifying disk state transitions during driver development.
+By utilizing this systematic binary mapping approach, developers can fully verify on-disk consistency, proving that the block bitmap allocations, path links, and physical blocks represent the identical, healthy data states.
 
 ---
 
@@ -842,25 +905,39 @@ Here is what the terminal output looks like when running `./analyze_disk.py` on 
 ======================================================================
       demofs Disk Image Visual Analyzer
 ======================================================================
-Analyzing File:     /tmp/disk_v4.img
+Analyzing File:     /tmp/disk_v5.img
 Total File Size:    1048576 bytes
 Block Size:         4096 bytes
 Calculated Blocks:  256
 
-[0] Raw Disk Metadata Blocks Dump (Hex View)
+[0] Raw Disk Metadata Blocks Dump with Field Mapping (Hex View)
+
   Block 0 (Superblock) | Byte Offset 0x0000 (first 64 bytes):
   0x0000:  ff 00 eb de 00 10 00 00  00 01 00 00 20 00 00 00   |............ ...|
-  0x0010:  fb 00 00 00 1e 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x0010:  fa 00 00 00 1d 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x0020:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x0030:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  Field Mapping Annotation:
+    ├─ 0x0000-0x0003 [ff 00 eb de]: magic number (0xdeeb00ff)
+    ├─ 0x0004-0x0007 [00 10 00 00]: block_size (4096 bytes)
+    ├─ 0x0008-0x000b [00 01 00 00]: blocks_count (256 blocks)
+    ├─ 0x000c-0x000f [20 00 00 00]: inodes_count (32 inodes)
+    ├─ 0x0010-0x0013 [fa 00 00 00]: free_blocks (250 blocks)
+    └─ 0x0014-0x0017 [1d 00 00 00]: free_inodes (29 inodes)
 
   Block 1 (Block Bitmap) | Byte Offset 0x1000 (first 16 bytes):
-  0x1000:  1f 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x1000:  3f 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |?...............|
+  Field Mapping Annotation:
+    └─ 0x1000           [3f]: block allocation mask (0b00111111 in binary)
+                           -> Physical block(s) 0, 1, 2, 3, 4, 5 are currently allocated.
 
   Block 2 (Inode Bitmap) | Byte Offset 0x2000 (first 16 bytes):
-  0x2000:  03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x2000:  07 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  Field Mapping Annotation:
+    └─ 0x2000           [07]: inode allocation mask (0b00000111 in binary)
+                           -> Inode slot(s) 0 (Reserved), 1 (Root Dir), 2 are currently allocated.
 
-  Block 3 (Inode Table) | Byte Offset 0x3000 (first 128 bytes):
+  Block 3 (Inode Table) | Byte Offset 0x3000 (first 192 bytes):
   0x3000:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x3010:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x3020:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
@@ -869,8 +946,22 @@ Calculated Blocks:  256
   0x3050:  04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x3060:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x3070:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x3080:  a4 81 00 00 00 00 01 00  2c 00 00 00 01 00 00 00   |........,.......|
+  0x3090:  05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x30a0:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x30b0:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  Field Mapping Annotation (for Inode 1 [Root Directory] starting at 0x3040):
+    ├─ 0x3040-0x3041 [ed 41]:       mode (0x41ed -> drwxr-xr-x directory)
+    ├─ 0x3048-0x304b [00 10 00 00]: size (4096 bytes)
+    ├─ 0x304c-0x304f [01 00 00 00]: blocks (1 blocks allocated)
+    └─ 0x3050-0x3053 [04 00 00 00]: block[0] (Direct Pointer 0 -> Block 4 holds contents)
+  Field Mapping Annotation (for Inode 2 starting at 0x3080):
+    ├─ 0x3080-0x3081 [a4 81]:       mode (0x81a4 -> -rw-r--r-- regular file)
+    ├─ 0x3088-0x308b [2c 00 00 00]: size (44 bytes)
+    ├─ 0x308c-0x308f [01 00 00 00]: blocks (1 blocks allocated)
+    └─ 0x3090-0x3093 [05 00 00 00]: block[0] (Direct Pointer 0 -> Block 5 holds file contents)
 
-  Block 4 (Root Dir Data Block) | Byte Offset 0x4000 (first 128 bytes):
+  Block 4 (Root Dir Data Block) | Byte Offset 0x4000 (first 192 bytes):
   0x4000:  01 00 00 00 2e 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x4010:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x4020:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
@@ -879,6 +970,25 @@ Calculated Blocks:  256
   0x4050:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x4060:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
   0x4070:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x4080:  02 00 00 00 64 69 73 6b  66 69 6c 65 2e 74 78 74   |....diskfile.txt|
+  0x4090:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x40a0:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  0x40b0:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00   |................|
+  Field Mapping Annotation:
+    ├─ Entry 0 ('.' | Offset 0x4000-0x403f):
+    │  ├─ 0x4000-0x4003 [01 00 00 00]: inode number (Inode 1)
+    │  └─ 0x4004-0x4007 [2e 00 00 00...]: entry name (".")
+    ├─ Entry 1 ('..' | Offset 0x4040-0x407f):
+    │  ├─ 0x4040-0x4043 [01 00 00 00]: inode number (Inode 1)
+    │  └─ 0x4044-0x4047 [2e 2e 00 00...]: entry name ("..")
+    └─ Entry 2 ('diskfile.txt' | Offset 0x4080-0x40bf):
+       ├─ 0x4080-0x4083 [02 00 00 00]: inode number (Inode 2)
+       └─ 0x4084-0x4087 [64 69 73 6b...]: entry name ("diskfile.txt")
+
+  Block 5 (File Data block) | Byte Offset 0x5000 (first 16 bytes):
+  0x5000:  44 65 6d 6f 66 73 20 56  65 72 73 69 6f 6e 20 35   |Demofs Version 5|
+  Field Mapping Annotation:
+    └─ 0x5000-0x502b [44 65 6d 6f...]: raw file content data ('Demofs Version 5 is Perfectly Synchronized!' ASCII string)
 
 ----------------------------------------------------------------------
 
@@ -917,7 +1027,7 @@ Calculated Blocks:  256
     Mode/Permissions: -rw-r--r-- (0o100644)
     Owner UID/GID:    0/0
     Links Count:      1
-    File Size:        32 bytes
+    File Size:        44 bytes
     Allocated Blocks: 1 blocks
     Direct Blocks:    [5]
 
@@ -925,7 +1035,7 @@ Calculated Blocks:  256
   / (Root Directory ──► Inode 1)
   ├── . ──► Inode 1
   ├── .. ──► Inode 1
-  └── diskfile.txt ──► Inode 2 (File, Size: 32B) [Content: 'Demofs Version 4 is Rock Solid!']
+  └── diskfile.txt ──► Inode 2 (File, Size: 44B) [Content: 'Demofs Version 5 is Perfectly Synchronized!']
 ======================================================================
 ```
 
