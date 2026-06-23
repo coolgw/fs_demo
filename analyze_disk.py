@@ -197,7 +197,7 @@ def analyze(disk_path):
         print(f"                           -> Inode slot(s) {inodes_str} are currently allocated.")
         print()
         
-        # Inode Table (Block 3) - Dump active inodes dynamically
+        # Inode Table (Block 3) - Dump active inodes dynamically (starts at 3 * 4096 = 12288 = 0x3000)
         max_active_ino = max(allocated_inodes_set) if allocated_inodes_set else 2
         dump_size = (max_active_ino + 1) * 64
         print(f"  {BOLD}{YELLOW}Block 3 (Inode Table) | Byte Offset 0x3000 (first {dump_size} bytes):{RESET}")
@@ -212,17 +212,28 @@ def analyze(disk_path):
             mode_hex = " ".join(f"{b:02x}" for b in ino_bytes[0:2])
             size_hex = " ".join(f"{b:02x}" for b in ino_bytes[8:12])
             blocks_hex = " ".join(f"{b:02x}" for b in ino_bytes[12:16])
-            bp_hex = " ".join(f"{b:02x}" for b in ino_bytes[16:20])
+            
+            # Use exact physical byte offset of 3 * BLOCK_SIZE (0x3000)
+            ino_start_offset = 3 * BLOCK_SIZE + ino * 64
             
             type_str = "directory" if stat.S_ISDIR(mode) else "regular file"
-            print(f"  {BOLD}{MAGENTA}Field Mapping Annotation (for Inode {ino} starting at 0x{3000 + ino*64:04x}):{RESET}")
-            print(f"    ├─ {BOLD}0x{3000 + ino*64:04x}-0x{3000 + ino*64 + 1:04x}{RESET} [{mode_hex}]:       {CYAN}mode (0x{mode:04x} -> {format_mode(mode)} {type_str}){RESET}")
-            print(f"    ├─ {BOLD}0x{3000 + ino*64 + 8:04x}-0x{3000 + ino*64 + 11:04x}{RESET} [{size_hex}]: {CYAN}size ({size} bytes){RESET}")
-            print(f"    ├─ {BOLD}0x{3000 + ino*64 + 12:04x}-0x{3000 + ino*64 + 15:04x}{RESET} [{blocks_hex}]: {CYAN}blocks ({blocks} blocks allocated){RESET}")
+            print(f"  {BOLD}{MAGENTA}Field Mapping Annotation (for Inode {ino} starting at 0x{ino_start_offset:04x}):{RESET}")
+            print(f"    ├─ {BOLD}0x{ino_start_offset:04x}-0x{ino_start_offset + 1:04x}{RESET} [{mode_hex}]:       {CYAN}mode (0x{mode:04x} -> {format_mode(mode)} {type_str}){RESET}")
+            print(f"    ├─ {BOLD}0x{ino_start_offset + 8:04x}-0x{ino_start_offset + 11:04x}{RESET} [{size_hex}]: {CYAN}size ({size} bytes){RESET}")
+            print(f"    ├─ {BOLD}0x{ino_start_offset + 12:04x}-0x{ino_start_offset + 15:04x}{RESET} [{blocks_hex}]: {CYAN}blocks ({blocks} blocks allocated){RESET}")
+            
+            # DYNAMIC ALLOCATED BLOCK POINTERS ANNOTATION LOOP
             if blocks > 0:
-                print(f"    └─ {BOLD}0x{3000 + ino*64 + 16:04x}-0x{3000 + ino*64 + 19:04x}{RESET} [{bp_hex}]: {CYAN}block[0] (Direct Pointer 0 -> Block {bp[0]} holds contents){RESET}")
+                for b_idx in range(min(12, blocks)):
+                    bp_offset = ino_start_offset + 16 + b_idx * 4
+                    bp_val = bp[b_idx]
+                    bp_val_bytes = ino_bytes[16 + b_idx * 4 : 20 + b_idx * 4]
+                    bp_val_hex = " ".join(f"{b:02x}" for b in bp_val_bytes)
+                    connector = "└─" if b_idx == (blocks - 1) or b_idx == 11 else "├─"
+                    print(f"    {connector} {BOLD}0x{bp_offset:04x}-0x{bp_offset + 3:04x}{RESET} [{bp_val_hex}]: {CYAN}block[{b_idx}] (Direct Pointer {b_idx} -> Block {bp_val} holds contents){RESET}")
             else:
-                print(f"    └─ {BOLD}0x{3000 + ino*64 + 16:04x}-0x{3000 + ino*64 + 19:04x}{RESET} [{bp_hex}]: {CYAN}block[0] (Direct Pointer 0 -> unassigned){RESET}")
+                bp_hex_unassigned = " ".join(f"{b:02x}" for b in ino_bytes[16:20])
+                print(f"    └─ {BOLD}0x{ino_start_offset + 16:04x}-0x{ino_start_offset + 19:04x}{RESET} [{bp_hex_unassigned}]: {CYAN}block[0] (Direct Pointer 0 -> unassigned){RESET}")
         print()
         
         # Dump all allocated data blocks dynamically
@@ -426,7 +437,7 @@ def analyze(disk_path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        default_paths = ["/tmp/disk_v6.img", "/tmp/disk_v5.img", "/tmp/disk_v4.img"]
+        default_paths = ["/tmp/disk_v7.img", "/tmp/disk_v6.img", "/tmp/disk_v5.img"]
         chosen_path = None
         for p in default_paths:
             if os.path.exists(p):
